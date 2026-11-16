@@ -76,16 +76,24 @@ impl ClusterState {
     }
 
     fn available(&self) -> u64 {
-        self.max_running() - self.running()
+        self.max_running().saturating_sub(self.running())
     }
 
     fn try_increment(&self) -> bool {
-        let current = self.running.load(Ordering::Relaxed);
-        if current >= self.max_running() {
-            return false;
+        let max = self.max_running();
+        let mut current = self.running();
+        while current < max {
+            match self.running.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
         }
-        self.running.store(current + 1, Ordering::Relaxed);
-        true
+        false
     }
 
     fn decrement(&self) {
@@ -95,7 +103,7 @@ impl ClusterState {
 
 #[derive(Debug, Clone)]
 struct Candidate {
-    name: String,
+    index: usize,
     available: u64,
 }
 
@@ -133,40 +141,37 @@ impl ClusterPool {
 
     /// Admit one query to the least-loaded cluster of `group`, or fail fast with `Busy`.
     pub fn try_acquire(self: &Arc<Self>, group: &str) -> Result<Permit, AcquireError> {
-        let clusters = self.clusters(group).ok_or(AcquireError::UnknownGroup)?;
+        // Synchronize capacity changes with the check-and-increment operation.
+        let groups = self.groups.read().unwrap();
+        let clusters = groups.get(group).ok_or(AcquireError::UnknownGroup)?;
 
-        let candidates: Vec<Candidate> = clusters
+        let mut candidates: Vec<Candidate> = clusters
             .iter()
-            .map(|c| Candidate {
-                name: c.name.clone(),
+            .enumerate()
+            .map(|(index, c)| Candidate {
+                index,
                 available: c.available(),
             })
-            .filter(|c| c.available > 0)
             .collect();
 
-        let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
-        let name = candidates[chosen].name.clone();
-        let state = clusters
-            .iter()
-            .find(|c| c.name == name)
-            .ok_or(AcquireError::Busy)?;
-
-        if !state.try_increment() {
-            return Err(AcquireError::Busy);
-        }
+        let state = loop {
+            let chosen = pick(&candidates).ok_or(AcquireError::Busy)?;
+            let state = &clusters[candidates.swap_remove(chosen).index];
+            if state.try_increment() {
+                break Arc::clone(state);
+            }
+        };
+        drop(groups);
+        let permit = Permit { state };
 
         *self
             .admissions
             .lock()
             .unwrap()
-            .entry(format!("{group}/{name}"))
+            .entry(format!("{group}/{}", permit.cluster()))
             .or_insert(0) += 1;
 
-        Ok(Permit {
-            pool: Arc::clone(self),
-            group: group.to_string(),
-            cluster: name,
-        })
+        Ok(permit)
     }
 
     /// Part 3: like `try_acquire`, but wait up to `wait` for a slot to free up.
@@ -177,12 +182,6 @@ impl ClusterPool {
     ) -> Result<Permit, AcquireError> {
         let _ = (group, wait);
         todo!("Part 3")
-    }
-
-    fn release(&self, group: &str, cluster: &str) {
-        if let Some(state) = self.find(group, cluster) {
-            state.decrement();
-        }
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -208,7 +207,11 @@ impl ClusterPool {
 
     /// Admin API: change a cluster's capacity at runtime.
     pub fn set_max_running(&self, group: &str, cluster: &str, max_running: u64) {
-        if let Some(state) = self.find(group, cluster) {
+        let groups = self.groups.write().unwrap();
+        if let Some(state) = groups
+            .get(group)
+            .and_then(|clusters| clusters.iter().find(|c| c.name == cluster))
+        {
             state.max_running.store(max_running, Ordering::Relaxed);
         }
     }
@@ -240,26 +243,34 @@ fn build_groups(config: &PoolConfig) -> HashMap<String, Vec<Arc<ClusterState>>> 
         .groups
         .iter()
         .map(|(group, clusters)| {
-            let states = clusters.iter().map(|c| Arc::new(ClusterState::new(c))).collect();
+            let states = clusters
+                .iter()
+                .map(|c| Arc::new(ClusterState::new(c)))
+                .collect();
             (group.clone(), states)
         })
         .collect()
 }
 
 /// Proof of admission. The holder may run one query on `cluster()`.
+/// Dropping the permit returns its slot, including on cancellation or unwinding.
 pub struct Permit {
-    pool: Arc<ClusterPool>,
-    group: String,
-    cluster: String,
+    state: Arc<ClusterState>,
 }
 
 impl Permit {
     pub fn cluster(&self) -> &str {
-        &self.cluster
+        &self.state.name
     }
 
     /// Give the slot back once the query has finished.
     pub fn release(self) {
-        self.pool.release(&self.group, &self.cluster);
+        drop(self);
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.state.decrement();
     }
 }
