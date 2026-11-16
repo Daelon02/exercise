@@ -6,14 +6,15 @@
 |----------|------------|------------------|-----|
 | INC-1 | Admission used a separate load and store. Concurrent callers could both get the same slot, while one increment was lost. A concurrent release could also be overwritten. Extra releases then wrapped the counter to `u64::MAX`, wedging admission. | `inc1_concurrent_admission_respects_cap_and_recovers_slots` | Reserve with a compare-and-exchange loop that rechecks the observed count against the cap after every conflict. |
 | INC-2 | When the cap dropped below the running count, unsigned subtraction panicked in debug and wrapped in release. The wrapped value made the over-cap cluster win selection, and its rejection hid free peers. | `inc2_capacity_cut_drains_existing_queries`, `inc2_capacity_cut_keeps_other_clusters_available` | Use saturating subtraction, let existing queries drain, and try other candidates. Synchronize capacity updates with reservation using the existing config lock. |
-| INC-3 | Candidate availability was a snapshot. If another caller took the selected cluster's last slot, admission returned `Busy` without trying another cluster. INC-2's wrapped availability caused the same symptom. | `inc3_contended_selection_tries_other_free_clusters` | Attempt candidates in descending snapshot free-capacity order, discarding each failed candidate. Include initially full clusters, since a release may have occurred since the snapshot. |
+| INC-3 | Candidate availability was a snapshot. If another caller took the selected cluster's last slot, admission returned `Busy` without trying another cluster. INC-2's wrapped availability caused the same symptom. | `inc3_contended_selection_tries_other_free_clusters` | Try the cluster with the most free capacity first, then try the remaining clusters if reservation fails. Include initially full clusters, since a release may have occurred since the snapshot. Part 2 replaces the original candidate vector with this allocation-free scan. |
 | INC-4 | Only explicit `release()` returned a slot. Dropping a permit on cancellation, disconnection, or panic leaked capacity. | `inc4_dropped_permit_returns_its_slot`, `inc4_unwinding_returns_its_slot`, `inc4_cancelled_query_returns_its_slot` | The permit owns the exact reserved cluster state. `Drop` decrements it; consuming `release()` delegates to `drop(self)`, so it cannot decrement twice. |
 
 No public types, method names, or signatures changed; no dependencies were added.
 The counter uses relaxed atomics because it protects a numeric count, not query
-data. Admission holds the config read lock through reservation; capacity updates
-take its write lock, so a concurrent reservation cannot use a stale cap after an
-update completes. Admission does not take an exclusive config lock. Lowering the
+data. Admission holds a config read lock through reservation; capacity updates
+take all config write locks (sharded in Part 2), so a concurrent reservation
+cannot use a stale cap after an update completes. Admission does not take an
+exclusive config lock. Lowering the
 cap does not revoke existing permits; that cluster admits no new queries until
 the count drops below the new cap. A zero cap disables new admissions.
 
@@ -32,26 +33,114 @@ Validation after Part 1:
 - `rustfmt --edition 2021 --check src/lib.rs tests/incidents.rs` and
   `git diff --check`: pass.
 
-Scope: Part 1 only. Performance benchmarks, waiting, distributed admission, and
-the bonus fixes are not included. `reload` still resets counters and `reconcile`
-can still overwrite concurrent accounting; holding the original state in a
-permit does not by itself solve those bonus incidents.
+Scope: Parts 1 and 2. Waiting, distributed admission, and the bonus fixes are not
+included. `reload` still resets running counters and `reconcile` can still
+overwrite concurrent accounting; holding the original state in a permit does
+not by itself solve those bonus incidents.
 
 ## Part 2: Performance
 
-Machine (CPU and core count):
+Measured on 2026-11-16: Apple M3 Max, 14 physical / 14 logical cores, macOS
+27.2.1, rustc 1.99.0. Thus the 16-thread case oversubscribes this machine.
+Criterion 0.5.1, release profile, 100 samples, 3 seconds warm-up and 3 seconds
+measurement per case. Runs were sequential, with no other tests or benchmark
+processes launched alongside them. No dependencies were added.
 
-| Bench | Before | After |
-|-------|--------|-------|
-| acquire_release/1  | | |
-| acquire_release/4  | | |
-| acquire_release/16 | | |
+The starter was reconstructed in a separate scratch directory from commit
+`9f1efff`, using the same Cargo.lock as this checkout. Both the unchanged starter
+and the Part 1 version were measured before editing the library for Part 2.
+The supplied benchmark was not changed; its SHA-256 in both copies is
+`4a85e2853ae90d9c2957a775c1599bcfe2b406576cd1dd5a649e4b5f7ffd3a71`.
 
-Changes, and why each one helps (or didn't):
+Throughput is millions of benchmark elements per second (higher is better):
 
--
+| Bench | Starter | Before Part 2 (Part 1) | After Part 2 | After / starter |
+|-------|--------:|----------------------:|-------------:|----------------:|
+| acquire_release/1 | 1.8275 | 7.6361 | 50.5603 | 27.67x |
+| acquire_release/4 | 2.9344 | 2.1159 | 11.0747 | 3.77x |
+| acquire_release/16 | 2.2183 | 3.3662 | 8.6828 | **3.91x** |
 
-Selection policy, and why:
+The 16-thread target is met: 3.91x the starter and 2.58x Part 1. Criterion's
+95% throughput intervals for that case were [2.2012, 2.2453] M/s (starter) and
+[8.3215, 9.0932] M/s (final). These are local measurements, not a portable
+speed guarantee. The earlier sharded-reader trial also reached 8.4893 M/s.
+
+Criterion's time estimates, in ns per iteration, were:
+
+| Threads | Starter | Part 1 | Part 2 |
+|--------:|--------:|-------:|-------:|
+| 1 | 547.197 | 130.958 | 19.778 |
+| 4 | 1363.145 | 1890.441 | 361.184 |
+| 16 | 7212.799 | 4753.176 | 1842.719 |
+
+Each benchmark iteration represents one attempt per worker, so throughput is
+`threads / iteration_time`, not `1 / iteration_time`. The supplied benchmark
+counts attempts and ignores `Busy`; the buggy starter numbers must not be read
+as verified successful-query throughput. Correctness is checked separately.
+
+Commands (using the appropriate manifest for the starter snapshot):
+
+```sh
+cargo bench --bench admission -- --save-baseline starter
+cargo bench --bench admission -- --save-baseline part1
+cargo bench --bench admission -- --save-baseline optimized
+```
+
+Changes and their measured effect, in implementation order:
+
+1. **Per-cluster atomic admission metrics.** Replace the per-query global
+   metric mutex, formatted key allocation, and hash-map mutation with
+   `permit.state.admissions.fetch_add(1, Ordering::Relaxed)`. A registry retains
+   the shared counters across reload, removal, and re-addition, preserving the
+   existing lifetime-metric behavior. The registry mutex is now used only for
+   configuration changes and metric reads. Alone this made 16-thread throughput
+   worse: 3.3662 -> 1.6307 M/s. Removing this serialization exposed contention
+   elsewhere; it was not a standalone performance win.
+2. **Selection without heap allocation.** Remove the candidate vector and
+   repeated max searches. Scan for the most free capacity, attempt it, then
+   scan the remaining clusters on contention. Both success and exhausted-group
+   paths are O(n), with no candidate allocation or per-query string allocation.
+   Before splitting the config lock this measured 1.6064 M/s, indistinguishable
+   from the atomic-metrics trial within their confidence intervals. It did not
+   resolve the remaining bottleneck on its own.
+3. **Split config-reader contention.** All threads previously updated one
+   RwLock's reader bookkeeping even though they only read configuration. Keep
+   32 independently locked references to the same immutable `Arc<Groups>`.
+   Each thread selects one shard once; calls then read-lock only that shard.
+   Align shards to 128 bytes to avoid sharing reader-lock cache lines. Together
+   with steps 1–2 this increased the trial to 8.4893 M/s; the final full run
+   measured 8.6828 M/s. This strongly supports shared reader bookkeeping as the
+   remaining bottleneck, though no hardware-counter profiling was performed.
+
+The shard tradeoff is roughly 4 KiB of locks/references per pool and taking all
+32 write locks for rare admin updates. The configuration map and cluster states
+are shared, not copied 32 times. Writers always acquire locks in index order
+and hold every lock before changing a cap or publishing a new configuration.
+That preserves Part 1's synchronization and avoids cycles between writers.
+Threads may share a shard; this affects contention, not correctness. There is
+still a read lock on admission, so this is not a lock-free design.
+
+`find` now also borrows the group lookup and clones only the matching Arc, rather
+than allocating a group string and cloning a whole vector. It is used by getters
+and reconcile, not the acquire/release benchmark; no benchmark gain is attributed
+to this cleanup.
+
+Selection policy: choose the largest absolute `max_running - running`, saturated
+at zero, preserving the original free-slot preference for unequal capacities.
+Only if that reservation loses a race do we scan other clusters in config order.
+This is roughly least-loaded under concurrency, not an atomic global snapshot or
+a fairness guarantee. The fallback checks all remaining clusters and never
+returns Busy merely because the first candidate filled. Equal-capacity held
+queries spread with a running-count difference of at most one in the sequential
+regression test.
+
+Validation: 15 tests pass in both debug and release (7 incident, 5 new performance
+regression, 3 smoke). New tests cover unequal/equal capacity selection, exact
+metrics after 16,000 concurrent admissions, metric history across reload/removal,
+and visibility of config updates to 64 reader threads. `cargo clippy --all-targets
+-- -D warnings`, formatting checks on the changed Rust files, and `git diff
+--check` pass. The full test suite still fails only the six unimplemented Part 3
+waiting tests.
 
 ## Part 3: Waiting for a slot
 
