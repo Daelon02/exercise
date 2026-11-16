@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfig {
     pub name: String,
@@ -52,20 +54,24 @@ pub enum AcquireError {
 }
 
 #[derive(Debug)]
+// Keep cluster counters off the Arc reference-count cache line.
+#[repr(align(128))]
 struct ClusterState {
     name: String,
     max_running: AtomicU64,
     running: AtomicU64,
     admissions: Arc<AtomicU64>,
+    waiters: Arc<Waiters>,
 }
 
 impl ClusterState {
-    fn new(config: &ClusterConfig, admissions: Arc<AtomicU64>) -> Self {
+    fn new(config: &ClusterConfig, admissions: Arc<AtomicU64>, waiters: Arc<Waiters>) -> Self {
         Self {
             name: config.name.clone(),
             max_running: AtomicU64::new(config.max_running),
             running: AtomicU64::new(0),
             admissions,
+            waiters,
         }
     }
 
@@ -100,6 +106,23 @@ impl ClusterState {
 
     fn decrement(&self) {
         self.running.fetch_sub(1, Ordering::Relaxed);
+        self.waiters.notify.notify_one();
+    }
+}
+
+#[derive(Debug, Default)]
+struct Waiters {
+    notify: Notify,
+    queued: AtomicU64,
+}
+
+struct Queued<'a>(&'a Waiters);
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::Relaxed);
+        // Hand off a wake-up if this caller exits without taking the freed slot.
+        self.0.notify.notify_one();
     }
 }
 
@@ -118,15 +141,18 @@ struct ConfigShard(RwLock<Arc<Groups>>);
 pub struct ClusterPool {
     groups: [ConfigShard; CONFIG_SHARDS],
     admissions: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    waiters: Mutex<HashMap<String, Arc<Waiters>>>,
 }
 
 impl ClusterPool {
     pub fn new(config: PoolConfig) -> Arc<Self> {
         let mut admissions = HashMap::new();
-        let groups = Arc::new(build_groups(&config, &mut admissions));
+        let mut waiters = HashMap::new();
+        let groups = Arc::new(build_groups(&config, &mut admissions, &mut waiters));
         Arc::new(Self {
             groups: std::array::from_fn(|_| ConfigShard(RwLock::new(Arc::clone(&groups)))),
             admissions: Mutex::new(admissions),
+            waiters: Mutex::new(waiters),
         })
     }
 
@@ -185,8 +211,35 @@ impl ClusterPool {
         group: &str,
         wait: Duration,
     ) -> Result<Permit, AcquireError> {
-        let _ = (group, wait);
-        todo!("Part 3")
+        match self.try_acquire(group) {
+            Err(AcquireError::Busy) => {}
+            result => return result,
+        }
+        let started = tokio::time::Instant::now();
+        let waiters = self.waiters.lock().unwrap().get(group).cloned().unwrap();
+
+        tokio::time::timeout(wait, async {
+            waiters.queued.fetch_add(1, Ordering::Relaxed);
+            let _queued = Queued(&waiters);
+            let notified = waiters.notify.notified();
+            tokio::pin!(notified);
+
+            loop {
+                if started.elapsed() >= wait {
+                    return Err(AcquireError::Timeout);
+                }
+                // Register before rechecking capacity to avoid a lost release.
+                notified.as_mut().enable();
+                match self.try_acquire(group) {
+                    Err(AcquireError::Busy) => {}
+                    result => return result,
+                }
+                notified.as_mut().await;
+                notified.set(waiters.notify.notified());
+            }
+        })
+        .await
+        .unwrap_or(Err(AcquireError::Timeout))
     }
 
     /// Current running count for a cluster, or `None` if it is not in the current config.
@@ -196,8 +249,12 @@ impl ClusterPool {
 
     /// Number of callers currently waiting inside `acquire_timeout` for `group`.
     pub fn queued(&self, group: &str) -> u64 {
-        let _ = group;
-        todo!("Part 3")
+        self.waiters
+            .lock()
+            .unwrap()
+            .get(group)
+            .map(|waiters| waiters.queued.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Total queries ever admitted to a cluster (a metric scraped by Prometheus).
@@ -213,11 +270,16 @@ impl ClusterPool {
     /// Admin API: change a cluster's capacity at runtime.
     pub fn set_max_running(&self, group: &str, cluster: &str, max_running: u64) {
         let groups = self.write_groups();
-        if let Some(state) = groups[0]
+        let waiters = groups[0]
             .get(group)
             .and_then(|clusters| clusters.iter().find(|c| c.name == cluster))
-        {
-            state.max_running.store(max_running, Ordering::Relaxed);
+            .map(|state| {
+                state.max_running.store(max_running, Ordering::Relaxed);
+                Arc::clone(&state.waiters)
+            });
+        drop(groups);
+        if let Some(waiters) = waiters {
+            waiters.notify.notify_waiters();
         }
     }
 
@@ -228,9 +290,17 @@ impl ClusterPool {
     pub fn reload(&self, config: PoolConfig) {
         let mut shards = self.write_groups();
         let mut admissions = self.admissions.lock().unwrap();
-        let groups = Arc::new(build_groups(&config, &mut admissions));
+        let mut waiters = self.waiters.lock().unwrap();
+        let groups = Arc::new(build_groups(&config, &mut admissions, &mut waiters));
         for shard in &mut shards {
             **shard = Arc::clone(&groups);
+        }
+        let wake: Vec<_> = waiters.values().cloned().collect();
+        drop(waiters);
+        drop(admissions);
+        drop(shards);
+        for waiters in wake {
+            waiters.notify.notify_waiters();
         }
     }
 
@@ -244,6 +314,7 @@ impl ClusterPool {
         let target = fetch().await;
         if let Some(state) = self.find(group, cluster) {
             state.running.store(target, Ordering::Relaxed);
+            state.waiters.notify.notify_waiters();
         }
     }
 }
@@ -251,11 +322,14 @@ impl ClusterPool {
 fn build_groups(
     config: &PoolConfig,
     admissions: &mut HashMap<String, Arc<AtomicU64>>,
+    waiters: &mut HashMap<String, Arc<Waiters>>,
 ) -> HashMap<String, Vec<Arc<ClusterState>>> {
     config
         .groups
         .iter()
         .map(|(group, clusters)| {
+            // Preserve group notifications across config changes, including removal.
+            let group_waiters = Arc::clone(waiters.entry(group.clone()).or_default());
             let states = clusters
                 .iter()
                 .map(|c| {
@@ -263,7 +337,11 @@ fn build_groups(
                     let count = admissions
                         .entry(format!("{group}/{}", c.name))
                         .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-                    Arc::new(ClusterState::new(c, Arc::clone(count)))
+                    Arc::new(ClusterState::new(
+                        c,
+                        Arc::clone(count),
+                        Arc::clone(&group_waiters),
+                    ))
                 })
                 .collect();
             (group.clone(), states)

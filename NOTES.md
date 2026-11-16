@@ -33,8 +33,8 @@ Validation after Part 1:
 - `rustfmt --edition 2021 --check src/lib.rs tests/incidents.rs` and
   `git diff --check`: pass.
 
-Scope: Parts 1 and 2. Waiting, distributed admission, and the bonus fixes are not
-included. `reload` still resets running counters and `reconcile` can still
+Scope: Parts 1–3. Distributed admission and the bonus fixes are not included.
+`reload` still resets running counters and `reconcile` can still
 overwrite concurrent accounting; holding the original state in a permit does
 not by itself solve those bonus incidents.
 
@@ -139,10 +139,58 @@ regression, 3 smoke). New tests cover unequal/equal capacity selection, exact
 metrics after 16,000 concurrent admissions, metric history across reload/removal,
 and visibility of config updates to 64 reader threads. `cargo clippy --all-targets
 -- -D warnings`, formatting checks on the changed Rust files, and `git diff
---check` pass. The full test suite still fails only the six unimplemented Part 3
-waiting tests.
+--check` pass. At the end of Part 2, the full suite failed only the six then
+unimplemented waiting tests; these now pass with Part 3.
 
 ## Part 3: Waiting for a slot
+
+`acquire_timeout` first tries immediate admission: free capacity and unknown
+groups return without entering the queue. A busy caller then uses its group's
+shared `Notify` and a single timeout covering all retries. The retry loop also
+checks elapsed time, so continuously ready notifications cannot extend the wait
+budget by keeping the inner future runnable.
+
+The pinned notification future is enabled **before** rechecking capacity. A
+release between that check and awaiting the notification therefore cannot be
+lost. Every permit release decrements `running` and calls `notify_one`, which
+wakes a waiter promptly without polling. Releases notify unconditionally:
+checking a relaxed queue counter first could race the first arriving waiter.
+
+A `Queued` guard increments/decrements the per-group count around the waiting
+operation. Its destructor runs on success, timeout, panic, and future drop. It
+also notifies another waiter: if this caller consumed a release notification
+but then expired or was cancelled, the free slot must not be stranded. Queues
+are independent between groups. This does not promise FIFO admission or prevent
+new `try_acquire` calls from taking a slot ahead of a woken waiter.
+
+Group waiter state is retained across config reloads, including removal and
+re-addition. Capacity updates, reloads, and reconciliation broadcast a recheck;
+notification callbacks run after the config/registry locks have been released.
+Removing a group wakes its callers to receive `UnknownGroup`. These wakeups do
+not fix the bonus running-counter identity or reconciliation races.
+
+The existing six waiting tests now pass. Seven additional tests cover zero
+wait, unknown groups, independent queues, multiple slots becoming available,
+config changes, cancellation of an already-notified waiter, expiration of an
+already-notified waiter, and preserving the deadline across repeated wakeups.
+The handoff tests manually poll futures to force those interleavings; the
+deadline tests use Tokio's paused clock.
+
+Validation: all **28 tests** pass in debug and release with
+`cargo test --no-fail-fast` and `cargo test --release --no-fail-fast`.
+`cargo clippy --all-targets -- -D warnings`, formatting checks on the changed
+Rust files, and `git diff --check` pass. No new dependencies or public API changes.
+
+Performance follow-up on the same machine and supplied 16-thread benchmark:
+unconditional notifications initially measured 6.7944 M attempts/s. A trial
+using sequentially consistent registration/reservation plus conditional
+notifications measured 6.6199 M/s; it did not show a benefit and was removed.
+The retained implementation instead aligns cluster state to 128 bytes, keeping
+its hot data separate from the Arc reference-count cache line. This costs
+padding per cluster but avoids false sharing. The final measurement was
+**10.8648 M attempts/s** (95% interval [10.503, 11.291]), **4.90x** the original
+starter. This is a local measurement with the same attempt-counting caveat as
+Part 2; no claim is made about end-to-end query throughput.
 
 ## Part 4: Global admission across 6 pods
 
