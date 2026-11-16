@@ -33,7 +33,7 @@ Validation after Part 1:
 - `rustfmt --edition 2021 --check src/lib.rs tests/incidents.rs` and
   `git diff --check`: pass.
 
-Scope: Parts 1–3. Distributed admission and the bonus fixes are not included.
+Scope: Parts 1–3 implemented; Part 4 is a written design. Bonus fixes are not included.
 `reload` still resets running counters and `reconcile` can still
 overwrite concurrent accounting; holding the original state in a permit does
 not by itself solve those bonus incidents.
@@ -193,6 +193,36 @@ starter. This is a local measurement with the same attempt-counting caveat as
 Part 2; no claim is made about end-to-end query throughput.
 
 ## Part 4: Global admission across 6 pods
+
+I would use one logical admission service backed by a three-member etcd quorum.
+For each engine cluster, an atomic compare-and-swap transaction checks the cap
+and counter revisions, reserves capacity, and records a unique query token.
+All six pods use this authority; routing caches are hints only. Acquire/release
+are idempotent by token, including retries after an uncertain RPC result.
+Lowering a cap blocks new grants until existing reservations drain. This uses
+etcd's [atomic transactions](https://etcd.io/docs/v3.6/learning/api/#transaction).
+
+All submissions must pass an engine-facing adapter that consumes each token at
+most once and rejects revoked tokens, including delayed submissions. Release
+requires confirmed query termination, not client disconnection or local Permit
+drop. A pod-liveness lease detects orphaned work; reservation keys must not
+expire with that lease. After pod death, revoke its tokens and cancel/reconcile
+its queries; reclaim slots only after termination and rejection of late
+submissions are confirmed. Where the engine/adapter cannot provide those
+guarantees, retain ambiguous reservations for manual recovery.
+
+During a partition, pods unable to reach the quorum stop issuing new queries;
+existing reservations remain charged. An unreachable engine prevents reclaiming
+its ambiguous slots. This sacrifices availability to preserve the global cap.
+The hot path adds an admission-service round trip, quorum-write latency and
+possible CAS retries, plus token validation at the engine boundary. Completion
+adds a release transaction; retries may delay reuse but never free twice.
+[etcd's guarantees](https://etcd.io/docs/v3.6/learning/api_guarantees/)
+cover the store, not termination of external SQL queries.
+
+I would not initially build cross-region active-active admission, distributed
+FIFO fairness, or leased batches of slots per pod. Those add recovery complexity
+before measured coordinator throughput justifies them.
 
 ## Bonus: INC-5 and INC-6
 
